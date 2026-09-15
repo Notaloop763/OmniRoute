@@ -1332,31 +1332,19 @@ export default function EditConnectionModal({
                     />
                     <div className="col-span-2">
                       <label className="block text-xs font-medium text-text-main mb-1">
-                        {providerText(
-                          t,
-                          "rateLimitOverridesModelConcurrencyLabel",
-                          "Per-model concurrency caps"
-                        )}
+                        {t("rateLimitOverridesModelConcurrencyLabel")}
                       </label>
                       <Textarea
                         value={formData.modelConcurrency}
                         onChange={(e) =>
                           setFormData({ ...formData, modelConcurrency: e.target.value })
                         }
-                        placeholder={providerText(
-                          t,
-                          "rateLimitOverridesModelConcurrencyPlaceholder",
-                          "glm-5=1\nglm-4.7=3"
-                        )}
+                        placeholder={t("rateLimitOverridesModelConcurrencyPlaceholder")}
                         rows={3}
                         data-testid="model-concurrency-input"
                       />
                       <p className="text-xs text-text-muted mt-1">
-                        {providerText(
-                          t,
-                          "rateLimitOverridesModelConcurrencyHint",
-                          "Optional: one model=cap per line, matched against the exact upstream model id. Queues excess requests locally; blank means no per-model cap."
-                        )}
+                        {t("rateLimitOverridesModelConcurrencyHint")}
                       </p>
                     </div>
                   </div>
