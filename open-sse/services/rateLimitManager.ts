@@ -40,6 +40,7 @@ import {
   getExecutorTimeoutMs,
   resolveConnectionTimeoutMs,
 } from "../handlers/chatCore/upstreamTimeouts.ts";
+import { boundedMap } from "../../src/lib/quota/boundedMap.ts";
 
 interface LearnedLimitEntry {
   provider: string;
@@ -91,8 +92,12 @@ const enabledConnections = new Set<string>();
 const connectionRateLimitOverrides = new Map<string, ConnectionRateLimitOverrides>();
 
 // Store learned limits for persistence (debounced)
-const learnedLimits: Record<string, LearnedLimitEntry> = {};
-const MAX_LEARNED_LIMITS = 200;
+// One learned entry per limiter key (provider:connection[:model]). The previous
+// `MAX_LEARNED_LIMITS = 200` was declared but never enforced; enforcing 200 would
+// start evicting (dropping persisted limits) on deployments with many
+// connection×model limiters, so the enforced cap is set well above that.
+export const MAX_LEARNED_LIMITS = 2048;
+const learnedLimits = boundedMap<LearnedLimitEntry>("learned-limits", MAX_LEARNED_LIMITS, "lru");
 const limiterLastUsed = new Map<string, number>();
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingAsyncOperations = new Set<Promise<unknown>>();
@@ -973,7 +978,7 @@ export function getAllRateLimitStatus() {
  * Get all learned limits (for dashboard display).
  */
 export function getLearnedLimits() {
-  return { ...learnedLimits };
+  return { ...Object.fromEntries(learnedLimits) };
 }
 
 // ─── Persistence ────────────────────────────────────────────────────────────
@@ -981,10 +986,8 @@ export function getLearnedLimits() {
 async function persistLearnedLimitsNow() {
   try {
     const { updateSettings } = await import("@/lib/db/settings");
-    await updateSettings({ learnedRateLimits: JSON.stringify(learnedLimits) });
-    logRateLimit(
-      `💾 [RATE-LIMIT] Persisted learned limits for ${Object.keys(learnedLimits).length} provider(s)`
-    );
+    await updateSettings({ learnedRateLimits: JSON.stringify(Object.fromEntries(learnedLimits)) });
+    logRateLimit(`💾 [RATE-LIMIT] Persisted learned limits for ${learnedLimits.size} provider(s)`);
   } catch (err) {
     errorRateLimit("[RATE-LIMIT] Failed to persist learned limits:", err.message);
   }
@@ -1000,12 +1003,12 @@ function recordLearnedLimit(
   model: string | null = null
 ) {
   const key = getLimiterKey(provider, connectionId, model);
-  learnedLimits[key] = {
+  learnedLimits.set(key, {
     ...limits,
     provider,
     connectionId,
     lastUpdated: Date.now(),
-  };
+  });
 
   // Debounce: save at most once per PERSIST_DEBOUNCE_MS
   if (!persistTimer) {
@@ -1058,8 +1061,8 @@ export async function __resetRateLimitManagerForTests() {
   limiterWatchdog.reset();
   shutdownHandlersRegistered = false;
 
-  for (const key of Object.keys(learnedLimits)) {
-    delete learnedLimits[key];
+  for (const key of [...learnedLimits.keys()]) {
+    learnedLimits.delete(key);
   }
 
   if (pendingAsyncOperations.size > 0) {
@@ -1112,14 +1115,14 @@ async function loadPersistedLimits() {
       const remaining = toNumber(data.remaining, 0);
       const minTime = toNumber(data.minTime, 0);
 
-      learnedLimits[key] = {
+      learnedLimits.set(key, {
         provider,
         connectionId,
         lastUpdated,
         ...(limit > 0 ? { limit } : {}),
         ...(remaining >= 0 ? { remaining } : {}),
         ...(minTime >= 0 ? { minTime } : {}),
-      };
+      });
 
       // Apply to limiter if it exists and has rate limit enabled
       if (connectionId && enabledConnections.has(connectionId)) {

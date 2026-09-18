@@ -19,6 +19,12 @@
  *   - a presented key that resolves but is no longer VALID (revoked, deactivated,
  *     banned or expired) is rejected with 401 too — existence of the row is not
  *     authorization (CWE-613); the 401 body is the `buildErrorBody()` shape;
+ *   - a VALID key still goes through the per-key operator policy
+ *     (`enforceApiKeyPolicy`: endpoint allowlist, schedule, usage cap, rate
+ *     limit) like every other `/v1` route — a key whose `allowedEndpoints`
+ *     excludes `batches` is rejected by the enforcer and sweeps nothing, for
+ *     BOTH path shapes the handler can see (`/v1/…` via the rewrite and the
+ *     App Router's own `/api/v1/…`) (omni-code-sec LEDGER-9/13/16);
  *   - no credentials at all → 401;
  *   - a sweep that throws → sanitized 500 (no stack trace, no raw SQLite message)
  *     and nothing deleted (the sweep is atomic).
@@ -56,6 +62,13 @@ async function sessionCookie(): Promise<string> {
   return `auth_token=${jwt}`;
 }
 
+/**
+ * `label` names the seeded batch's `.jsonl` file. Keep it word-shaped or under 10 chars: the
+ * gitleaks generic-api-key rule reports a literal of 10+ chars with Shannon entropy >= 3.5 that
+ * sits right after a `key*.id` argument (the argument supplies the rule's "key" keyword).
+ * `wvxc-route-401` did (entropy 3.66) and became `route401` in #13729; the word-shaped
+ * `wvxc-route-<scenario>` siblings stay under the entropy floor and are clean.
+ */
 function seedCompletedBatch(apiKeyId: string | null, label: string) {
   const file = createFile({
     bytes: 8,
@@ -74,12 +87,13 @@ function seedCompletedBatch(apiKeyId: string | null, label: string) {
   return { file, batch };
 }
 
-async function callDelete(headers: Record<string, string>) {
-  const res = await DELETE(new Request(ROUTE_URL, { method: "DELETE", headers }));
+async function callDelete(headers: Record<string, string>, url: string = ROUTE_URL) {
+  const res = await DELETE(new Request(url, { method: "DELETE", headers }));
   const body = (await res.json()) as {
     deleted?: boolean;
     deletedBatches?: number;
     deletedFiles?: number;
+    hasMore?: boolean;
     error?: { message: string; type?: string; code?: string };
   };
   return { res, body };
@@ -102,6 +116,11 @@ describe("DELETE /api/v1/batches/delete-completed — caller scope (GHSA-wvxc-jp
     assert.strictEqual(body.deleted, true);
     assert.strictEqual(body.deletedBatches, 0, "key A owns no completed batch — nothing to sweep");
     assert.strictEqual(body.deletedFiles, 0);
+    assert.strictEqual(
+      body.hasMore,
+      false,
+      "the response must surface deleteCompletedBatches' hasMore continuation flag (#13680)"
+    );
     assert.ok(getBatch(victim.batch.id), "key B's completed batch must survive key A's sweep");
     assert.strictEqual(
       getFileContent(victim.file.id)?.toString(),
@@ -250,9 +269,29 @@ describe("DELETE /api/v1/batches/delete-completed — caller scope (GHSA-wvxc-jp
     assert.ok(getBatch(unowned.batch.id), "the session branch is never reached");
   });
 
+  it("applies the caller's API-key policy: a key whose allowedEndpoints excludes 'batches' is rejected by the enforcer and sweeps nothing (both /api/v1 and /v1 path shapes)", async () => {
+    const keyA = await createApiKey("wvxc-route-policy-a", "machine-wvxc-pa", []);
+    await updateApiKeyPermissions(keyA.id, { allowedEndpoints: ["chat"] });
+    const own = seedCompletedBatch(keyA.id, "wvxc-route-policy-own");
+
+    for (const url of [ROUTE_URL, "http://localhost/v1/batches/delete-completed"]) {
+      const { res, body } = await callDelete({ Authorization: `Bearer ${keyA.key}` }, url);
+
+      assert.strictEqual(res.status, 403, `${url}: the enforcer's endpoint-allowlist rejection`);
+      assert.match(body.error?.message ?? "", /batches/, `${url}: names the blocked category`);
+      assert.ok(getBatch(own.batch.id), `${url}: nothing is swept when the policy rejects`);
+      assert.strictEqual(
+        getFileContent(own.file.id)?.toString(),
+        "wvxc-route-policy-own",
+        `${url}: file content is intact when the policy rejects`
+      );
+    }
+  });
+
   it("rejects an unauthenticated request with 401 and deletes nothing", async () => {
     const keyB = await createApiKey("wvxc-route-401-b", "machine-wvxc-401", []);
-    const seeded = seedCompletedBatch(keyB.id, "wvxc-route-401");
+    // short label: see the seedCompletedBatch docblock (#13729)
+    const seeded = seedCompletedBatch(keyB.id, "route401");
 
     const { res, body } = await callDelete({});
 
@@ -265,7 +304,8 @@ describe("DELETE /api/v1/batches/delete-completed — caller scope (GHSA-wvxc-jp
 
   it("returns a sanitized 500 (no stack trace, no raw SQLite message) when the sweep throws, and deletes nothing", async () => {
     const keyA = await createApiKey("wvxc-route-500-a", "machine-wvxc-500", []);
-    const own = seedCompletedBatch(keyA.id, "wvxc-route-500");
+    // short label: see the seedCompletedBatch docblock (#13729)
+    const own = seedCompletedBatch(keyA.id, "route500");
     const db = getDbInstance();
 
     db.exec(
@@ -287,7 +327,7 @@ describe("DELETE /api/v1/batches/delete-completed — caller scope (GHSA-wvxc-jp
     assert.ok(getBatch(own.batch.id), "a failed sweep leaves the batch row in place");
     assert.strictEqual(
       getFileContent(own.file.id)?.toString(),
-      "wvxc-route-500",
+      "route500",
       "a failed sweep rolls the file content back"
     );
   });
