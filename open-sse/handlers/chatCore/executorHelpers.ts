@@ -107,6 +107,19 @@ export function resolveModelSemaphoreKey({
   return buildModelSemaphoreKey({ provider, accountKey, model });
 }
 
+/** Per-model gate (key + cap) for the composite semaphore; key null = no gate. */
+export function resolveModelSemaphore(args: {
+  provider: string | null | undefined;
+  model: string;
+  connectionId: string | null | undefined;
+  credentials: Record<string, unknown> | null | undefined;
+}): { key: string | null; maxConcurrency: number | null } {
+  return {
+    key: resolveModelSemaphoreKey(args),
+    maxConcurrency: resolveModelSemaphoreMaxConcurrency(args.credentials, args.model),
+  };
+}
+
 export function buildClaudePromptCacheLogMeta(
   targetFormat: string,
   finalBody: Record<string, unknown> | null | undefined,

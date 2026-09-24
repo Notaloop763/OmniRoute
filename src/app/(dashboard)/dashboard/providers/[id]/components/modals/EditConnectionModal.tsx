@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useTranslations } from "next-intl";
-import { Button, Badge, Input, Modal, Toggle, Select, Textarea } from "@/shared/components";
+import { Button, Badge, Input, Modal, Toggle, Select } from "@/shared/components";
 import { CHATGPT_WEB_CODEX_CONNECTOR_NAME } from "@/shared/constants/chatgptWebCodex";
 import {
   isOpenAICompatibleProvider,
@@ -20,12 +20,12 @@ import { maskEmail } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { useNotificationStore } from "@/store/notificationStore";
 import { type CodexServiceTier } from "@/lib/providers/requestDefaults";
-import {
-  formatModelConcurrencyInput,
-  parseModelConcurrencyInput,
-} from "@/lib/providers/modelConcurrency";
 import type { ConnectionRateLimitOverrides } from "@/lib/db/providers/columns";
-import { isClaudeExtraUsageBlockEnabled } from "@/lib/providers/claudeExtraUsage";
+import ModelConcurrencyField from "./ModelConcurrencyField";
+import {
+  buildRateLimitOverridesFromForm,
+  modelConcurrencyFormValue,
+} from "./rateLimitOverridesFromForm";
 import { resolveDashboardProviderInfo } from "../../../providerPageUtils";
 import {
   isBaseUrlConfigurableProvider,
@@ -57,6 +57,11 @@ import { useOpenRouterPresetControl } from "../OpenRouterPresetInput";
 import WebSessionCredentialGuide from "../WebSessionCredentialGuide";
 import HarImportButton from "../HarImportButton";
 import CcCompatibleRequestDefaultsFields from "./CcCompatibleRequestDefaultsFields";
+import ClaudeConnectionFields from "./ClaudeConnectionFields";
+import {
+  claudeConnectionFieldPatch,
+  claudeConnectionFieldValues,
+} from "./claudeConnectionFieldValues";
 import { CodexConnectionFields } from "./CodexFingerprintFields";
 import { assignEditApiKeyProviderSpecificData } from "./connectionProviderSpecificData";
 import { isM365TierCapableProvider, normalizeM365TierValue, type M365TierValue } from "./m365Tier";
@@ -158,10 +163,7 @@ export default function EditConnectionModal({
     ccCompatibleSummarizeThinking: false,
     cloudCodeProjectId: "",
     antigravityClientProfile: "ide",
-    blockExtraUsage:
-      provider === "claude"
-        ? isClaudeExtraUsageBlockEnabled(provider, connectionProviderSpecificData)
-        : false,
+    ...claudeConnectionFieldValues(provider, connectionProviderSpecificData),
     passthroughModels: connectionProviderSpecificData?.passthroughModels === true,
     disableCooling: connectionProviderSpecificData?.disableCooling === true,
     importFreeModelsOnly: connectionProviderSpecificData?.importFreeModelsOnly === true,
@@ -348,12 +350,7 @@ export default function EditConnectionModal({
           connection.rateLimitOverrides?.maxConcurrent != null
             ? String(connection.rateLimitOverrides.maxConcurrent)
             : "",
-        // Per-model caps survive dashboard saves: the field loads the stored
-        // map and the save path below writes it back, so an API-configured
-        // map is never erased by editing unrelated connection settings.
-        modelConcurrency: formatModelConcurrencyInput(
-          connection.rateLimitOverrides?.modelConcurrency
-        ),
+        modelConcurrency: modelConcurrencyFormValue(connection.rateLimitOverrides),
         apiKey: "",
         // Unset per-connection override means "follow the global default" —
         // surface that as an empty field (0 renders as an explicit opt-out).
@@ -405,10 +402,7 @@ export default function EditConnectionModal({
         antigravityClientProfile: normalizeAntigravityClientProfileSetting(
           connection.providerSpecificData?.clientProfile
         ),
-        blockExtraUsage: isClaudeExtraUsageBlockEnabled(
-          effectiveProvider,
-          connection.providerSpecificData
-        ),
+        ...claudeConnectionFieldValues(effectiveProvider, connection.providerSpecificData),
         passthroughModels: connection?.providerSpecificData?.passthroughModels === true,
         disableCooling: connection?.providerSpecificData?.disableCooling === true,
         importFreeModelsOnly: connection?.providerSpecificData?.importFreeModelsOnly === true,
@@ -575,25 +569,9 @@ export default function EditConnectionModal({
         healthCheckInterval:
           formData.healthCheckInterval === "" ? undefined : formData.healthCheckInterval,
       };
-      const overrides: ConnectionRateLimitOverrides = {};
-      if (formData.rpm.trim()) overrides.rpm = Number(formData.rpm);
-      if (formData.rpd.trim()) overrides.rpd = Number(formData.rpd);
-      if (formData.tpm.trim()) overrides.tpm = Number(formData.tpm);
-      if (formData.tpd.trim()) overrides.tpd = Number(formData.tpd);
-      if (formData.minTime.trim()) overrides.minTime = Number(formData.minTime);
-      if (formData.maxWaitMs.trim()) overrides.maxWaitMs = Number(formData.maxWaitMs);
-      if (formData.rateLimitMaxConcurrent.trim())
-        overrides.maxConcurrent = Number(formData.rateLimitMaxConcurrent);
-      // Per-model concurrency ceilings (`model=cap`, one per line). A blank
-      // field means "no model caps"; malformed entries refuse the save so
-      // operator intent is never silently dropped.
-      const parsedModelConcurrency = parseModelConcurrencyInput(formData.modelConcurrency);
-      if (parsedModelConcurrency.error) {
-        setSaveError(parsedModelConcurrency.error);
-        return;
-      }
-      if (parsedModelConcurrency.map) overrides.modelConcurrency = parsedModelConcurrency.map;
-      updates.rateLimitOverrides = Object.keys(overrides).length > 0 ? overrides : null;
+      const rateLimit = buildRateLimitOverridesFromForm(formData);
+      if (rateLimit.error) return setSaveError(rateLimit.error);
+      updates.rateLimitOverrides = rateLimit.overrides;
       if (isAntigravityFamily) {
         updates.projectId = trimmedCloudCodeProjectId || null;
       }
@@ -715,7 +693,7 @@ export default function EditConnectionModal({
           excludedModels: parseExcludedModelsInput(formData.excludedModels),
         };
         if (isClaude) {
-          updates.providerSpecificData.blockExtraUsage = formData.blockExtraUsage;
+          Object.assign(updates.providerSpecificData, claudeConnectionFieldPatch(formData));
         }
         if (isCodex) {
           updates.providerSpecificData.requestDefaults = {
@@ -860,14 +838,11 @@ export default function EditConnectionModal({
           />
         )}
         {isClaude && (
-          <div className="flex flex-col gap-4 rounded-lg border border-border/50 bg-surface/20 p-4">
-            <Toggle
-              checked={formData.blockExtraUsage}
-              onChange={(checked) => setFormData({ ...formData, blockExtraUsage: checked })}
-              label={t("blockClaudeExtraUsageLabel")}
-              description={t("blockClaudeExtraUsageDescription")}
-            />
-          </div>
+          <ClaudeConnectionFields
+            values={formData}
+            showUsageWallOptions={isOAuth}
+            onChange={(patch) => setFormData({ ...formData, ...patch })}
+          />
         )}
         {(isCcCompatible || openRouterPreset.input) && (
           <div className="flex flex-col gap-4 rounded-lg border border-border/50 bg-surface/20 p-4">
@@ -1329,23 +1304,12 @@ export default function EditConnectionModal({
                       placeholder={t("inherit")}
                       hint={t("rateLimitOverridesMaxConcurrentHint")}
                     />
-                    <div className="col-span-2">
-                      <label className="block text-xs font-medium text-text-main mb-1">
-                        {t("rateLimitOverridesModelConcurrencyLabel")}
-                      </label>
-                      <Textarea
-                        value={formData.modelConcurrency}
-                        onChange={(e) =>
-                          setFormData({ ...formData, modelConcurrency: e.target.value })
-                        }
-                        placeholder={t("rateLimitOverridesModelConcurrencyPlaceholder")}
-                        rows={3}
-                        data-testid="model-concurrency-input"
-                      />
-                      <p className="text-xs text-text-muted mt-1">
-                        {t("rateLimitOverridesModelConcurrencyHint")}
-                      </p>
-                    </div>
+                    <ModelConcurrencyField
+                      value={formData.modelConcurrency}
+                      onChange={(modelConcurrency) =>
+                        setFormData({ ...formData, modelConcurrency })
+                      }
+                    />
                   </div>
                 </div>
               </div>

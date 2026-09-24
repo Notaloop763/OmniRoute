@@ -60,6 +60,7 @@ import {
   persistAntigravityFamilyCooldownIfQuota,
 } from "@omniroute/open-sse/services/antigravityFamilyCooldown.ts";
 import { markQuotaPreflightAccountUnavailable } from "./quotaPreflightUnavailable.ts";
+import { buildNoAuthModelCooldown } from "./noAuthModelCooldown.ts";
 import { getCreditsMode } from "@omniroute/open-sse/services/antigravityCredits.ts";
 import { preferAntigravityConnectionsWithStoredProject } from "@omniroute/open-sse/services/antigravityProjectPersistence.ts";
 import {
@@ -73,12 +74,14 @@ import {
   getModelLockoutInfo,
   lockModel,
   hasPerModelQuota,
+  hasPerModelFailureScope,
   getRuntimeProviderProfile,
   recordModelLockoutFailure,
   retryHintBypassesMaxCooldownMs,
   isProviderModelUnsupported400,
 } from "@omniroute/open-sse/services/accountFallback.ts";
 import { isSharedWalletCredits402 } from "@omniroute/open-sse/services/accountFallback/sharedWalletCredits.ts";
+import { isOpencodeFreeTierRefusalForProvider } from "@omniroute/open-sse/executors/opencodeGeoBlock.ts";
 import { isLocalProvider } from "@omniroute/open-sse/config/providerRegistry.ts";
 import { COOLDOWN_MS, RateLimitReason } from "@omniroute/open-sse/config/constants.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
@@ -169,6 +172,12 @@ import { loadOptionalNoAuthApiKeyCredentials } from "./noAuthOptionalApiKey";
 import { getResource404Bypass } from "./requestResourceHealth";
 import { isVertexConnectionWidePermissionDenied } from "./vertexErrorClassifier";
 import { maybeAutoDisableBannedAccount } from "./autoDisableBannedAccount";
+import {
+  buildAntigravityRoutingFields,
+  releaseRoutingLeaseFromCredentials,
+  reserveAntigravityLeaseForSelection,
+  type AntigravityLease,
+} from "./antigravityLeaseSelection";
 import * as log from "../utils/logger";
 import {
   fisherYatesShuffle,
@@ -214,6 +223,9 @@ export interface CredentialSelectionOptions {
   _leaseRetryWithLockHeld?: boolean;
   /** Internal: freeze the original policy-valid candidate set across lease race/preflight retry. */
   _leaseCandidateIds?: string[];
+  /** Antigravity account lease (#10011): only the final chat dispatch opts in. */
+  reserveAntigravityLease?: boolean;
+  routingRequestId?: string | null;
 }
 export type ExclusiveLeaseSelectionResult = {
   exclusiveLease: ExclusiveConnectionLease;
@@ -649,9 +661,6 @@ function buildSyntheticNoAuthCredentials(providerSpecificData: JsonRecord = {}):
   errorCode: null;
   rateLimitedUntil: null;
   maxConcurrent: null;
-  // Pure-synthetic credentials carry no DB row, so they never carry a
-  // per-model cap either — the chat core must not acquire a model gate.
-  modelConcurrency: null;
   allRateLimited?: never;
   allExpired?: never;
   retryAfter?: never;
@@ -675,7 +684,6 @@ function buildSyntheticNoAuthCredentials(providerSpecificData: JsonRecord = {}):
     errorCode: null,
     rateLimitedUntil: null,
     maxConcurrent: null,
-    modelConcurrency: null,
   };
 }
 
@@ -1051,6 +1059,8 @@ async function materializeConnection(
   extra: DeferredLeaseSelection & {
     exclusiveLease?: ExclusiveConnectionLease;
     reactivatedFromInactive?: boolean;
+    routingLease?: AntigravityLease;
+    requestedModel?: string | null;
   } = {}
 ) {
   const providerSpecificData = await hydrateConnectionProviderSpecificData(connection);
@@ -1084,12 +1094,11 @@ async function materializeConnection(
     errorCode: connection.errorCode,
     rateLimitedUntil: connection.rateLimitedUntil,
     maxConcurrent: connection.maxConcurrent,
-    // Carry only the normalized per-model cap map onto the runtime
-    // credential — never unrelated rate-limit config or secrets. Missing or
-    // malformed maps fail open to "no model cap" (null).
+    // normalized per-model cap map only; malformed fails open (null)
     modelConcurrency: normalizeModelConcurrencyMap(connection.rateLimitOverrides?.modelConcurrency),
     quotaWindowThresholds: connection.quotaWindowThresholds ?? null,
     ...(releaseOAuthSession ? { releaseOAuthSession } : {}),
+    ...buildAntigravityRoutingFields(extra.routingLease, connection.id, extra.requestedModel),
     ...extra,
   };
 }
@@ -1216,11 +1225,16 @@ export async function getProviderCredentials(
           ? getModelLockoutInfo(resolvedId, SYNTHETIC_NOAUTH_CONNECTION_ID, requestedModel)
           : null;
         if (modelLockout && modelLockout.remainingMs > 0) {
-          log.debug(
-            "AUTH",
-            `${resolvedId} | noauth model-only lockout for ${requestedModel} — ${modelLockout.remainingMs}ms remaining, returning null`
-          );
-          return null;
+          // Not-found style locks stay a plain "no credentials"; any other lock is a
+          // temporary cooldown that the chat handler can wait out or answer with a 429.
+          return isRetryableModelLockoutReason(modelLockout.reason)
+            ? buildNoAuthModelCooldown(
+                resolvedId,
+                requestedModel!,
+                modelLockout,
+                SYNTHETIC_NOAUTH_CONNECTION_ID
+              )
+            : null;
         }
         return await maybeSyntheticNoAuthFallback(resolvedId, excludedForNoAuth);
       }
@@ -2196,6 +2210,14 @@ export async function getProviderCredentials(
       }
     }
 
+    const reserved = reserveAntigravityLeaseForSelection(
+      provider,
+      connection,
+      requestedModel,
+      options
+    );
+    if (reserved.busy) return reserved.busy;
+
     if (provider === "antigravity" && connection) {
       log.info(
         "AUTH",
@@ -2206,6 +2228,8 @@ export async function getProviderCredentials(
     return materializeConnection(connection, options, {
       exclusiveLease,
       ...probeStamp,
+      routingLease: reserved.lease,
+      requestedModel,
     });
   } finally {
     selectionLock?.release();
@@ -2315,15 +2339,20 @@ export async function getProviderCredentialsWithQuotaPreflight(
       );
       if (claim.kind === "LOST") {
         selectedCredentials.releaseOAuthSession?.();
+        releaseRoutingLeaseFromCredentials(credentials);
         excludedConnectionIds.add(connectionId);
         pendingCredentialSelection =
           await selectedCredentials.selectNextLeaseCandidate?.(connectionId);
         return null;
       }
-      if (claim.kind === "STALE") return { leaseFenceStale: true };
+      if (claim.kind === "STALE") {
+        releaseRoutingLeaseFromCredentials(credentials);
+        return { leaseFenceStale: true };
+      }
       await selectedCredentials.commitSelectionSideEffects?.();
       if (options.materializeCredentials === false) {
         selectedCredentials.releaseOAuthSession?.();
+        releaseRoutingLeaseFromCredentials(credentials);
         return { exclusiveLease: claim.lease, connectionId, provider };
       }
       return { ...credentials, exclusiveLease: claim.lease };
@@ -2422,6 +2451,7 @@ export async function getProviderCredentialsWithQuotaPreflight(
       );
     } catch (error) {
       selectedCredentials.releaseOAuthSession?.();
+      releaseRoutingLeaseFromCredentials(credentials);
       throw error;
     }
     if (preflight.proceed) {
@@ -2431,6 +2461,7 @@ export async function getProviderCredentialsWithQuotaPreflight(
     }
 
     selectedCredentials.releaseOAuthSession?.();
+    releaseRoutingLeaseFromCredentials(credentials);
 
     const unavailableUntil = await markQuotaPreflightAccountUnavailable(
       provider,
@@ -2687,6 +2718,10 @@ export async function markAccountUnavailable(
       return { shouldFallback: true, cooldownMs: 0 };
     }
 
+    // Request-scoped refusal: nothing about it belongs on this account or this model.
+    if (isOpencodeFreeTierRefusalForProvider(provider, status, errorText))
+      return { shouldFallback: true, cooldownMs: 0 };
+
     // ─── Anti-Thundering Herd Guard ─────────────────────────────────
     // If this connection was ALREADY marked unavailable by a prior concurrent
     // request (within the mutex window), skip re-marking to avoid resetting
@@ -2805,7 +2840,6 @@ export async function markAccountUnavailable(
     // per-model lockout branches (per-model quota 403/404, codex scope) are left
     // as-is — extending disableCooling to model lockout is a follow-up.
     const disableCooling = connProviderSpecificData.disableCooling === true;
-
     const isPerModelQuotaProvider = hasPerModelQuota(provider, model, connectionPassthroughModels);
 
     // #10334 — connection-scope branch: the matched provider rule declared scope
@@ -2980,7 +3014,7 @@ export async function markAccountUnavailable(
       return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
     }
     if (
-      isPerModelQuotaProvider &&
+      hasPerModelFailureScope(provider, model, connectionPassthroughModels, status) &&
       provider &&
       provider !== "codex" &&
       model &&
