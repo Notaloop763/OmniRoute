@@ -8,14 +8,15 @@
  *   glm-5=1
  *   glm-4.7=3
  *
- * Pure — no imports — so it is unit-testable without the dashboard harness.
+ * Pure — imports only the server-free @/shared/constants/modelConcurrency leaf
+ * — so it is unit-testable without the dashboard harness.
  */
 
 import {
   MODEL_CONCURRENCY_MAX_CAP,
   MODEL_CONCURRENCY_MAX_KEY_LENGTH,
   type ModelConcurrencyMap,
-} from "@/lib/db/providers/columns";
+} from "@/shared/constants/modelConcurrency";
 
 export interface ParsedModelConcurrency {
   map: ModelConcurrencyMap | null;

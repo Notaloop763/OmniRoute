@@ -35,7 +35,7 @@ import { isValidProviderIconUrl } from "@/shared/validation/iconUrl";
 import {
   MODEL_CONCURRENCY_MAX_CAP,
   MODEL_CONCURRENCY_MAX_KEY_LENGTH,
-} from "@/lib/db/providers/columns";
+} from "@/shared/constants/modelConcurrency";
 
 export { validateProviderSpecificData };
 

@@ -1,7 +1,14 @@
 /**
  * db/providers/columns.ts — Pure column-normalizer helpers for provider_connections rows.
- * No DB access; no imports — JSON/Object/builtins only.
+ * No DB access; the only import is the server-free @/shared/constants/modelConcurrency
+ * leaf — JSON/Object/builtins otherwise.
  */
+
+import {
+  MODEL_CONCURRENCY_MAX_CAP,
+  MODEL_CONCURRENCY_MAX_KEY_LENGTH,
+  type ModelConcurrencyMap,
+} from "@/shared/constants/modelConcurrency";
 
 export type JsonRecord = Record<string, unknown>;
 
@@ -64,18 +71,7 @@ export function normalizeBooleanColumn(value: unknown, fallback: boolean): boole
   return fallback;
 }
 
-// Per-model upstream concurrency ceilings, keyed by the exact model string
-// passed to the executor after routing resolution (normally the bare
-// upstream model id, e.g. "glm-5"). Values are positive-integer
-// concurrent-request ceilings. Optional; absent means no model-specific gate.
-export type ModelConcurrencyMap = Record<string, number>;
-
-// Bounds for `modelConcurrency` entries. Keys are bounded so a malicious
-// payload can't bloat the DB row with megabyte-long model ids; caps are
-// positive integers with the same ceiling as the scalar `maxConcurrent`
-// override (10_000).
-export const MODEL_CONCURRENCY_MAX_KEY_LENGTH = 128;
-export const MODEL_CONCURRENCY_MAX_CAP = 10_000;
+// ModelConcurrencyMap and its bounds live in the server-free @/shared/constants/modelConcurrency leaf.
 
 // Per-connection rate limit overrides shape. Scalar fields keep their legacy
 // semantics; `modelConcurrency` adds opt-in per-model concurrency ceilings
