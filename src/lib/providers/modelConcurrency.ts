@@ -20,8 +20,11 @@ import {
 
 export interface ParsedModelConcurrency {
   map: ModelConcurrencyMap | null;
-  /** Zero-based line-oriented error for the first malformed entry, if any. */
-  error: string | null;
+  /**
+   * The first malformed entry, verbatim (trimmed), or null when the text is
+   * valid. The UI turns it into a localized message.
+   */
+  invalidEntry: string | null;
 }
 
 /**
@@ -38,13 +41,13 @@ export function formatModelConcurrencyInput(map: ModelConcurrencyMap | null | un
 
 /**
  * Parse editor text into a normalized map. Blank text parses to `{ map: null,
- * error: null }` (no model caps). The first malformed entry aborts with a
- * human-readable `error` and a null map so the caller can refuse the save
- * instead of silently dropping operator intent. Duplicate models: last wins.
+ * invalidEntry: null }` (no model caps). The first malformed entry aborts with
+ * that entry in `invalidEntry` and a null map so the caller can refuse the
+ * save instead of silently dropping operator intent. Duplicate models: last wins.
  */
 export function parseModelConcurrencyInput(text: string): ParsedModelConcurrency {
   const raw = typeof text === "string" ? text : "";
-  if (raw.trim() === "") return { map: null, error: null };
+  if (raw.trim() === "") return { map: null, invalidEntry: null };
   const map: ModelConcurrencyMap = {};
   const entries = raw
     .split(/[\n,]/)
@@ -62,12 +65,9 @@ export function parseModelConcurrencyInput(text: string): ParsedModelConcurrency
       cap < 1 ||
       cap > MODEL_CONCURRENCY_MAX_CAP
     ) {
-      return {
-        map: null,
-        error: `Invalid per-model concurrency entry "${entry}" — use model=cap with a positive whole number up to ${MODEL_CONCURRENCY_MAX_CAP}.`,
-      };
+      return { map: null, invalidEntry: entry };
     }
     map[model] = cap;
   }
-  return { map: Object.keys(map).length === 0 ? null : map, error: null };
+  return { map: Object.keys(map).length === 0 ? null : map, invalidEntry: null };
 }

@@ -340,8 +340,9 @@ concurrency caps**, one `model=cap` per line) or via
 
 - **Connection-wide vs model-specific:** `maxConcurrent` remains the shared
   connection-wide ceiling. When both apply, both gates are acquired
-  atomically in the same composite gate (`global → provider → account →
-model`); the effective behavior is the stricter applicable limit.
+  atomically in the same composite gate
+  (`global → provider → account → model`); the effective behavior is the
+  stricter applicable limit.
 - **Exact model-key match:** the key is the model string passed to the
   executor after routing resolution — normally the bare upstream model id
   (`glm-5`), not a client-side `provider/model` alias (`zai/glm-5` does not

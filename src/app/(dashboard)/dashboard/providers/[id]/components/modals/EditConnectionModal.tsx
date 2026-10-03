@@ -569,8 +569,9 @@ export default function EditConnectionModal({
         healthCheckInterval:
           formData.healthCheckInterval === "" ? undefined : formData.healthCheckInterval,
       };
-      const rateLimit = buildRateLimitOverridesFromForm(formData);
-      if (rateLimit.error) return setSaveError(rateLimit.error);
+      const rateLimit = buildRateLimitOverridesFromForm(formData, connection?.rateLimitOverrides);
+      const invalid = rateLimit.invalidModelConcurrency;
+      if (invalid) return setSaveError(t("rateLimitOverridesModelConcurrencyInvalid", invalid));
       updates.rateLimitOverrides = rateLimit.overrides;
       if (isAntigravityFamily) {
         updates.projectId = trimmedCloudCodeProjectId || null;
